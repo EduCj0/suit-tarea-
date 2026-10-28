@@ -1,0 +1,7 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "post-list",
+  "type": "array",
+  "minItems": 1,
+  "items": { "$ref": "post" }
+}

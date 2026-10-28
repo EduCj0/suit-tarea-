@@ -1,0 +1,111 @@
+name: Pruebas API y E2E
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 12 * * 1-5'   # lunes a viernes 06:17 (hora del centro de México): detecta cambios en los sitios externos
+
+permissions:
+  contents: write        # publicar el reporte Allure en la rama gh-pages
+  pages: write
+  issues: write
+
+concurrency:
+  group: pruebas-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pruebas:
+    name: Ejecutar suite (API + E2E)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Descargar código
+        uses: actions/checkout@v4
+
+      - name: Instalar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Revisión de tipos (TypeScript)
+        run: npm run typecheck
+
+      - name: Instalar navegadores de Playwright
+        run: npx playwright install --with-deps chromium firefox
+
+      - name: Ejecutar pruebas
+        id: pruebas
+        continue-on-error: true
+        run: npx playwright test
+
+      - name: Generar reporte de ejecución (resumen del job)
+        if: always()
+        run: npm run report:resumen
+
+      - name: Recuperar historial de Allure de la ejecución anterior
+        if: always()
+        continue-on-error: true
+        run: |
+          git fetch origin gh-pages --depth=1
+          git worktree add gh-pages-anterior origin/gh-pages
+          mkdir -p allure-results/history
+          cp -r gh-pages-anterior/history/* allure-results/history/ || true
+
+      - name: Generar reporte Allure
+        if: always()
+        run: npx allure generate allure-results --clean -o allure-report
+
+      - name: Guardar reportes como artefactos
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reportes-${{ github.run_number }}
+          path: |
+            allure-report
+            playwright-report
+            reporte-ejecucion.md
+            test-results
+          retention-days: 30
+
+      - name: Publicar Allure en GitHub Pages
+        if: always() && github.ref == 'refs/heads/main'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: allure-report
+          publish_branch: gh-pages
+
+      - name: Notificar resultado (Slack o Discord, si hay webhook configurado)
+        if: always()
+        env:
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$WEBHOOK_URL" ]; then echo "Sin webhook configurado: se omite la notificación externa."; exit 0; fi
+          MSG=$(node -e "const r=require('./resumen.json');const e=r.fallo?'❌ FALLOS':'✅ APROBADO';console.log(e+' · '+(r.ok+r.inestable)+'/'+r.total+' pruebas ('+r.pct+' %) · '+r.dur.toFixed(1)+' s')")
+          TEXTO="Pruebas de ${GITHUB_REPOSITORY} (${GITHUB_REF_NAME}): ${MSG}\nAllure: ${PAGES_URL}\nEjecución: ${RUN_URL}"
+          # Slack usa "text" y Discord usa "content"; se envían ambos campos.
+          curl -sS -X POST -H 'Content-Type: application/json' \
+            -d "{\"text\":\"${TEXTO}\",\"content\":\"${TEXTO}\"}" "$WEBHOOK_URL"
+
+      - name: Abrir issue si fallan las pruebas en main
+        if: always() && steps.pruebas.outcome == 'failure' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create --title "Pruebas fallidas en la ejecución #${{ github.run_number }}" \
+            --body-file reporte-ejecucion.md --label "pruebas-fallidas" || \
+          gh issue create --title "Pruebas fallidas en la ejecución #${{ github.run_number }}" --body-file reporte-ejecucion.md
+
+      - name: Marcar el job como fallido si hubo pruebas fallidas
+        if: steps.pruebas.outcome == 'failure'
+        run: exit 1
